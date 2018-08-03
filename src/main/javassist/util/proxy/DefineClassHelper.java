@@ -21,6 +21,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodHandles.Lookup;
 import java.lang.reflect.Method;
 import java.security.ProtectionDomain;
+import java.util.List;
 
 import javassist.CannotCompileException;
 import javassist.bytecode.ClassFile;
@@ -50,8 +51,12 @@ public class DefineClassHelper
                 Class<?> defineClass(String name, byte[] b, int off, int len,
                         ClassLoader loader, ProtectionDomain protectionDomain)
                                 throws ClassFormatError {
-                    if (stack.getCallerClass() != SecuredPrivileged.JAVA_9.getClass())
-                        throw new IllegalAccessError("Access denied for caller.");
+                    try {
+                        if (getCallerClass.invoke(stack) != SecuredPrivileged.JAVA_9.getClass())
+                            throw new IllegalAccessError("Access denied for caller.");
+                    } catch (Exception e) {
+                        throw new RuntimeException("cannot initialize", e);
+                    }
                     try {
                         return (Class<?>) defineClass.invokeWithArguments(
                                 sunMiscUnsafeTheUnsafe.theUnsafe,
@@ -63,18 +68,48 @@ public class DefineClassHelper
                     }
                 }
             }
-            private final StackWalker stack = StackWalker
-                    .getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE);
+            private final Object stack;
+            private final Method getCallerClass;
+            {
+                Class<?> stackWalkerClass = null;
+                try {
+                    stackWalkerClass = Class.forName("java.lang.StackWalker");
+                } catch (ClassNotFoundException e) {
+                    // Skip initialization when the class doesn't exist i.e. we are on JDK < 9
+                }
+                if (stackWalkerClass != null) {
+                    try {
+                        Class<?> optionClass = Class.forName("java.lang.StackWalker$Option");
+                        stack = stackWalkerClass.getMethod("getInstance", optionClass)
+                                // The first one is RETAIN_CLASS_REFERENCE
+                                .invoke(null, optionClass.getEnumConstants()[0]);
+                        getCallerClass = stackWalkerClass.getMethod("getCallerClass");
+                    } catch (Throwable e) {
+                        throw new RuntimeException("cannot initialize", e);
+                    }
+                } else {
+                    stack = null;
+                    getCallerClass = null;
+                }
+            }
             private final ReferencedUnsafe sunMiscUnsafe = getReferencedUnsafe();
             private final ReferencedUnsafe getReferencedUnsafe()
             {
-                if (null != SecuredPrivileged.JAVA_9
-                        && stack.getCallerClass() != this.getClass())
-                    throw new IllegalAccessError("Access denied for caller.");
+                try {
+                    if (null != SecuredPrivileged.JAVA_9
+                            && getCallerClass.invoke(stack) != this.getClass())
+                        throw new IllegalAccessError("Access denied for caller.");
+                } catch (Exception e) {
+                    throw new RuntimeException("cannot initialize", e);
+                }
                 try {
                     SecurityActions.TheUnsafe usf = SecurityActions.getSunMiscUnsafeAnonymously();
+                    List<Method> defineClassMethod = usf.methods.get("defineClass");
+                    // On Java 11+ the defineClass method does not exist anymore
+                    if (null == defineClassMethod)
+                        return null;
                     MethodHandle meth = MethodHandles.lookup()
-                            .unreflect(usf.methods.get("defineClass").get(0));
+                            .unreflect(defineClassMethod.get(0));
                     return new ReferencedUnsafe(usf, meth);
                 } catch (Throwable e) {
                     throw new RuntimeException("cannot initialize", e);
@@ -86,8 +121,12 @@ public class DefineClassHelper
                     ClassLoader loader, ProtectionDomain protectionDomain)
                             throws ClassFormatError
             {
-                if (stack.getCallerClass() != DefineClassHelper.class)
-                    throw new IllegalAccessError("Access denied for caller.");
+                try {
+                    if (getCallerClass.invoke(stack) != DefineClassHelper.class)
+                        throw new IllegalAccessError("Access denied for caller.");
+                } catch (Exception e) {
+                    throw new RuntimeException("cannot initialize", e);
+                }
                 return sunMiscUnsafe.defineClass(name, b, off, len, loader,
                         protectionDomain);
             }
@@ -171,11 +210,15 @@ public class DefineClassHelper
                 ClassLoader loader, ProtectionDomain protectionDomain) throws ClassFormatError;
     }
 
-    private static final SecuredPrivileged privileged = ClassFile.MAJOR_VERSION >= ClassFile.JAVA_9
-            ? SecuredPrivileged.JAVA_9
-            : ClassFile.MAJOR_VERSION >= ClassFile.JAVA_7
-                    ? SecuredPrivileged.JAVA_7
-                    : SecuredPrivileged.JAVA_OTHER;
+    // Java 11+ removed sun.misc.Unsafe.defineClass, so we fallback to invoking defineClass on
+    // ClassLoader until we have an implementation that uses MethodHandles.Lookup.defineClass
+    private static final SecuredPrivileged privileged = ClassFile.MAJOR_VERSION > ClassFile.JAVA_10
+            ? SecuredPrivileged.JAVA_OTHER
+            : ClassFile.MAJOR_VERSION >= ClassFile.JAVA_9
+                ? SecuredPrivileged.JAVA_9
+                : ClassFile.MAJOR_VERSION >= ClassFile.JAVA_7
+                        ? SecuredPrivileged.JAVA_7
+                        : SecuredPrivileged.JAVA_OTHER;
 
     /**
      * Loads a class file by a given class loader.
@@ -203,7 +246,8 @@ public class DefineClassHelper
             throw e;
         }
         catch (ClassFormatError e) {
-            throw new CannotCompileException(e.getCause());
+            Throwable t = e.getCause();
+            throw new CannotCompileException(t == null ? e : t);
         }
         catch (Exception e) {
             throw new CannotCompileException(e);
